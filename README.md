@@ -71,6 +71,23 @@ modem.getNetworkType();     // "LTE", "GSM", "NO SERVICE"
 modem.getConnectedMode();   // A7670E_MODE_LTE / A7670E_MODE_2G after connectNetwork()
 ```
 
+### Strict LTE only
+
+```cpp
+modem.setStrictLTE(true);   // or #define TINY_GSM_A7670E_STRICT_LTE 1 before the include
+modem.isOnLTE();            // registered and serving on LTE right now
+```
+
+With strict LTE on, the modem never uses 2G:
+
+- LTE-only (`AT+CNMP=38`) is set now and again on every `init()`, so it survives a modem restart.
+- `use2G()`, `useAuto()` and `setNetworkMode()` with any non-LTE mode return `false`.
+- `connectNetwork()` tries LTE only, whatever preference you pass. With no LTE coverage it fails instead of falling back.
+- The network counts as connected only on LTE registration (`CEREG`). 2G registration (`CREG`) is ignored.
+- `powerStressTest()` stays on LTE, even with `force2G = true`.
+
+See [examples/LteOnly](examples/LteOnly/LteOnly.ino).
+
 ### Battery power: is it the supply or the modem?
 
 On battery, the A7670E draws up to 2 A in short 2G transmit bursts (about 1 A on LTE). If the battery, wires or regulator can't deliver that, the voltage dips, the modem resets or shuts down, and it looks like the modem "stopped working". The library can tell the two cases apart.
@@ -137,6 +154,7 @@ See [examples/PowerCheck](examples/PowerCheck/PowerCheck.ino).
 | `TINY_GSM_A7670E_VBAT_CRITICAL_MV` | `3400` |
 | `TINY_GSM_A7670E_VBAT_MAX_DROP_MV` | `300` |
 | `TINY_GSM_A7670E_STRESS_SAMPLE_MS` | `50` |
+| `TINY_GSM_A7670E_STRICT_LTE` | `0` (`1` = strict LTE only from the start) |
 | `TINY_GSM_A7670E_NO_TYPEDEFS` | define to skip the `TinyGsm` / `TinyGsmClient` typedefs |
 
 ## Limits

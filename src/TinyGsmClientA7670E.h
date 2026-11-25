@@ -56,6 +56,11 @@
 #define TINY_GSM_A7670E_STRESS_SAMPLE_MS 50
 #endif
 
+// 1 = strict LTE from the start (same as calling setStrictLTE(true)).
+#ifndef TINY_GSM_A7670E_STRICT_LTE
+#define TINY_GSM_A7670E_STRICT_LTE 0
+#endif
+
 #define TINY_GSM_MUX_COUNT 10
 #define TINY_GSM_BUFFER_READ_AND_CHECK_SIZE
 #ifdef AT_NL
@@ -236,6 +241,7 @@ class TinyGsmA7670E : public TinyGsmModem<TinyGsmA7670E>,
     supplyReader_  = nullptr;
     lastBootMs_    = 0;
     connectedMode_ = 0;
+    strictLTE_     = TINY_GSM_A7670E_STRICT_LTE;
   }
 
   /*
@@ -266,6 +272,13 @@ class TinyGsmA7670E : public TinyGsmModem<TinyGsmA7670E>,
     waitResponse(10000L);
     sendAT(GF("+CTZU=1"));
     waitResponse(10000L);
+
+    // Strict LTE: put the radio back in LTE-only on every init (also after
+    // a modem restart).
+    if (strictLTE_) {
+      sendAT(GF("+CNMP="), (uint8_t)A7670E_MODE_LTE);
+      if (waitResponse() != 1) { DBG(GF("### Could not set LTE only")); }
+    }
 
     SimStatus ret = getSimStatus();
     if (ret != SIM_READY && pin != nullptr && strlen(pin) > 0) {
@@ -336,9 +349,35 @@ class TinyGsmA7670E : public TinyGsmModem<TinyGsmA7670E>,
   }
 
   // 2 = automatic, 13 = GSM only, 38 = LTE only
+  // In strict LTE mode anything other than A7670E_MODE_LTE is refused.
   bool setNetworkMode(uint8_t mode) {
+    if (strictLTE_ && mode != A7670E_MODE_LTE) {
+      DBG(GF("### Strict LTE: mode refused:"), mode);
+      return false;
+    }
     sendAT(GF("+CNMP="), mode);
     return waitResponse() == 1;
+  }
+
+  /**
+   * Strict LTE: the modem only ever uses LTE. Sets LTE-only now and on every
+   * init(), refuses 2G/auto modes, counts the network as connected only on
+   * LTE registration (CEREG), and makes connectNetwork() LTE-only.
+   */
+  bool setStrictLTE(bool enable = true) {
+    strictLTE_ = enable;
+    if (!enable) { return true; }
+    return setNetworkMode(A7670E_MODE_LTE);
+  }
+  bool isStrictLTE() const {
+    return strictLTE_;
+  }
+
+  // True if the modem is registered and serving on LTE right now.
+  bool isOnLTE() {
+    A7670ERegStatus s = getRegistrationStatus();
+    return (s == A7670E_REG_OK_HOME || s == A7670E_REG_OK_ROAMING) &&
+           getNetworkType() == "LTE";
   }
 
   // Set the DNS servers used by the socket stack (APN DNS is not always usable).
@@ -355,6 +394,7 @@ class TinyGsmA7670E : public TinyGsmModem<TinyGsmA7670E>,
   bool isNetworkConnectedImpl() {
     A7670ERegStatus s = getRegistrationStatus();
     if (s == A7670E_REG_OK_HOME || s == A7670E_REG_OK_ROAMING) { return true; }
+    if (strictLTE_) { return false; }  // 2G registration doesn't count
     s = getGsmRegistrationStatus();
     return (s == A7670E_REG_OK_HOME || s == A7670E_REG_OK_ROAMING);
   }
@@ -730,6 +770,7 @@ class TinyGsmA7670E : public TinyGsmModem<TinyGsmA7670E>,
                       A7670ENetworkPref pref             = A7670E_PREFER_LTE,
                       uint32_t          timeoutPerModeMs = 60000UL,
                       const char* user = nullptr, const char* pwd = nullptr) {
+    if (strictLTE_) { pref = A7670E_LTE_ONLY; }  // never fall back to 2G
     uint8_t modes[2];
     uint8_t count = 0;
     switch (pref) {
@@ -872,7 +913,7 @@ class TinyGsmA7670E : public TinyGsmModem<TinyGsmA7670E>,
     t.minMv  = t.idleMv;
 
     int16_t oldMode = getNetworkMode();
-    if (force2G) { setNetworkMode(A7670E_MODE_2G); }
+    if (force2G && !strictLTE_) { setNetworkMode(A7670E_MODE_2G); }
     setPhoneFunctionality(0);
     delay(1000);
     setPhoneFunctionality(1);  // registration -> transmit bursts
@@ -967,6 +1008,7 @@ class TinyGsmA7670E : public TinyGsmModem<TinyGsmA7670E>,
   uint16_t           diagUnderSnap_;
   uint32_t           lastBootMs_;
   uint8_t            connectedMode_;
+  bool               strictLTE_;
 };
 
 // Same names TinyGsmClient.h would give, so existing code keeps working.
