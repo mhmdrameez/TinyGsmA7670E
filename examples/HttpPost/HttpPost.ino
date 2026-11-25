@@ -31,14 +31,13 @@ void setup() {
   }
   Serial.println("IMEI: " + modem.getIMEI());
 
-  if (!modem.waitForNetwork(90000UL)) {
-    Serial.println("No network");
+  // LTE first, 2G if LTE fails (includes the 2 s NETOPEN settle delay).
+  if (!modem.connectNetwork(APN, A7670E_PREFER_LTE, 90000UL)) {
+    Serial.println("No network / data attach failed");
+    Serial.println(a7670ePowerVerdictText(modem.diagnosePower()));
     return;
   }
-  if (!modem.gprsConnect(APN)) {  // includes the 2 s NETOPEN settle delay
-    Serial.println("Data attach failed");
-    return;
-  }
+  Serial.println("Network: " + modem.getNetworkType());
   modem.setDNS("8.8.8.8", "1.1.1.1");
   Serial.println("IP: " + modem.getLocalIP());
 

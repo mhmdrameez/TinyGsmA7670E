@@ -38,6 +38,24 @@
 #define TINY_GSM_A7670E_CIPOPEN_RETRY_MS 2000UL
 #endif
 
+// Power diagnostics. The A7670E runs on 3.4-4.2 V and shuts itself down
+// below about 3.4 V; 2G transmit bursts draw up to 2 A.
+#ifndef TINY_GSM_A7670E_POWER_MONITOR
+#define TINY_GSM_A7670E_POWER_MONITOR 1  // sample VBAT after attach/connect
+#endif
+#ifndef TINY_GSM_A7670E_VBAT_LOW_MV
+#define TINY_GSM_A7670E_VBAT_LOW_MV 3500
+#endif
+#ifndef TINY_GSM_A7670E_VBAT_CRITICAL_MV
+#define TINY_GSM_A7670E_VBAT_CRITICAL_MV 3400
+#endif
+#ifndef TINY_GSM_A7670E_VBAT_MAX_DROP_MV
+#define TINY_GSM_A7670E_VBAT_MAX_DROP_MV 300  // idle -> under-load sag
+#endif
+#ifndef TINY_GSM_A7670E_STRESS_SAMPLE_MS
+#define TINY_GSM_A7670E_STRESS_SAMPLE_MS 50
+#endif
+
 #define TINY_GSM_MUX_COUNT 10
 #define TINY_GSM_BUFFER_READ_AND_CHECK_SIZE
 #ifdef AT_NL
@@ -72,6 +90,78 @@ enum A7670ERegStatus {
   A7670E_REG_UNKNOWN      = 4,
   A7670E_REG_OK_ROAMING   = 5,
 };
+
+// AT+CNMP values.
+enum A7670ENetworkMode : uint8_t {
+  A7670E_MODE_AUTO = 2,
+  A7670E_MODE_2G   = 13,  // GSM only
+  A7670E_MODE_LTE  = 38,  // LTE only
+};
+
+// Order in which connectNetwork() tries the radios.
+enum A7670ENetworkPref : uint8_t {
+  A7670E_PREFER_LTE = 0,  // LTE, then 2G if LTE fails
+  A7670E_PREFER_2G,       // 2G, then LTE
+  A7670E_LTE_ONLY,
+  A7670E_2G_ONLY,
+  A7670E_AUTO,            // let the modem choose
+};
+
+// Answer of diagnosePower() / powerStressTest().
+enum A7670EPowerVerdict : uint8_t {
+  A7670E_PWR_OK = 0,           // supply fine, modem fine
+  A7670E_PWR_WEAK,             // modem works, but supply is low or sags a lot
+  A7670E_PWR_BROWNOUT,         // modem reset/shut down because of the supply
+  A7670E_PWR_MODEM_ISSUE,      // supply fine, modem hung: not a power problem
+  A7670E_PWR_NO_RESPONSE,      // modem silent, no supply reading to decide
+  A7670E_PWR_RUN_STRESS_TEST,  // modem restarted, voltage looked fine: run
+                               // powerStressTest() to find out
+};
+
+inline const char* a7670ePowerVerdictText(A7670EPowerVerdict v) {
+  switch (v) {
+    case A7670E_PWR_OK: return "OK: supply and modem fine";
+    case A7670E_PWR_WEAK:
+      return "WEAK SUPPLY: modem works but voltage is low or sags under load";
+    case A7670E_PWR_BROWNOUT:
+      return "POWER PROBLEM: modem reset/shut down from low supply";
+    case A7670E_PWR_MODEM_ISSUE:
+      return "MODEM PROBLEM: supply fine but modem not answering";
+    case A7670E_PWR_NO_RESPONSE:
+      return "MODEM SILENT: set a supply reader to tell power from modem";
+    case A7670E_PWR_RUN_STRESS_TEST:
+      return "MODEM RESTARTED: voltage looked fine, run powerStressTest()";
+  }
+  return "?";
+}
+
+// Running power statistics (millivolts / counts).
+struct A7670EPowerStats {
+  int16_t  lastMv;               // last AT+CBC reading
+  int16_t  minMv;                // lowest reading since reset
+  int16_t  maxMv;                // highest reading since reset
+  uint16_t samples;              // number of readings
+  uint16_t reboots;              // modem restarts seen (RDY / echo back on)
+  uint16_t underVoltWarnings;    // "UNDER-VOLTAGE WARNNING" URCs
+  uint16_t underVoltPowerDowns;  // "UNDER-VOLTAGE POWER DOWN" URCs
+  uint16_t overVoltage;          // "OVER-VOLTAGE ..." URCs
+  uint16_t mcuSupplyMv;          // last reading from setSupplyReader()
+};
+
+// Result of powerStressTest().
+struct A7670EPowerTest {
+  int16_t            idleMv;    // average before the radio starts
+  int16_t            minMv;     // lowest reading during the test
+  int16_t            dropMv;    // idleMv - minMv
+  uint16_t           samples;
+  bool               restarted;         // modem rebooted during the test
+  bool               stoppedAnswering;  // modem went silent
+  bool               underVoltage;      // modem reported under-voltage
+  A7670EPowerVerdict verdict;
+};
+
+// MCU-side supply reading in mV (e.g. ADC on a battery divider), or 0.
+typedef uint16_t (*A7670ESupplyReader)();
 
 class TinyGsmA7670E : public TinyGsmModem<TinyGsmA7670E>,
                       public TinyGsmGPRS<TinyGsmA7670E>,
@@ -142,6 +232,10 @@ class TinyGsmA7670E : public TinyGsmModem<TinyGsmA7670E>,
  public:
   explicit TinyGsmA7670E(Stream& stream) : stream(stream) {
     memset(sockets, 0, sizeof(sockets));
+    resetPowerStats();
+    supplyReader_  = nullptr;
+    lastBootMs_    = 0;
+    connectedMode_ = 0;
   }
 
   /*
@@ -321,6 +415,9 @@ class TinyGsmA7670E : public TinyGsmModem<TinyGsmA7670E>,
     // "+NETOPEN: 0" arrives before the IP stack can open sockets; an
     // immediate CIPOPEN returns ERROR. Give it time to settle.
     delay(TINY_GSM_A7670E_NETOPEN_SETTLE_MS);
+#if TINY_GSM_A7670E_POWER_MONITOR
+    sampleVoltage();  // right after the attach bursts
+#endif
     return true;
   }
 
@@ -419,6 +516,9 @@ class TinyGsmA7670E : public TinyGsmModem<TinyGsmA7670E>,
         int8_t err       = streamGetIntBefore('\n');
         if (openedMux == mux && err == 0) {
           DBG(GF("### CIPOPEN ok on attempt"), attempt);
+#if TINY_GSM_A7670E_POWER_MONITOR
+          sampleVoltage();
+#endif
           return true;
         }
         DBG(GF("### CIPOPEN err"), err, GF("attempt"), attempt);
@@ -567,15 +667,306 @@ class TinyGsmA7670E : public TinyGsmModem<TinyGsmA7670E>,
       }
       data = "";
       return true;
+    } else if (data.endsWith(GF(AT_NL "RDY")) ||
+               data.endsWith(GF("*ATREADY:"))) {
+      // Boot messages: the modem has just (re)started.
+      if (data.endsWith(GF(":"))) { streamSkipUntil('\n'); }
+      noteBoot();
+      data = "";
+      return true;
+    } else if (data.endsWith(GF("-VOLTAGE WARN")) ||
+               data.endsWith(GF("-VOLTAGE POWER DOWN"))) {
+      // "UNDER-VOLTAGE WARNNING" / "UNDER-VOLTAGE POWER DOWN" /
+      // "OVER-VOLTAGE WARNNING" / "OVER-VOLTAGE POWER DOWN"
+      bool under = data.indexOf("UNDER") >= 0;
+      bool down  = data.endsWith(GF("DOWN"));
+      if (!down) { streamSkipUntil('\n'); }  // rest of "WARNNING"
+      if (!under) {
+        stats_.overVoltage++;
+      } else if (down) {
+        stats_.underVoltPowerDowns++;
+      } else {
+        stats_.underVoltWarnings++;
+      }
+      DBG(under ? "### UNDER-VOLTAGE" : "### OVER-VOLTAGE",
+          down ? "POWER DOWN" : "WARNING");
+      data = "";
+      return true;
     }
     return false;
+  }
+
+  /*
+   * Network mode (LTE / 2G)
+   */
+ public:
+  bool useLTE() {
+    return setNetworkMode(A7670E_MODE_LTE);
+  }
+  bool use2G() {
+    return setNetworkMode(A7670E_MODE_2G);
+  }
+  bool useAuto() {
+    return setNetworkMode(A7670E_MODE_AUTO);
+  }
+
+  // Radio actually in use: "LTE", "GSM", "NO SERVICE"... ("" = no answer).
+  String getNetworkType() {
+    sendAT(GF("+CPSI?"));
+    if (waitResponse(GF("+CPSI:")) != 1) { return ""; }
+    String type = stream.readStringUntil(',');
+    waitResponse();
+    type.trim();
+    return type;
+  }
+
+  /**
+   * Register and open data in one call, falling back to the other radio.
+   *   modem.connectNetwork("airteliot.com");                    // LTE, then 2G
+   *   modem.connectNetwork("airteliot.com", A7670E_2G_ONLY);
+   * @return true when data is up. getConnectedMode() says which radio.
+   */
+  bool connectNetwork(const char*       apn,
+                      A7670ENetworkPref pref             = A7670E_PREFER_LTE,
+                      uint32_t          timeoutPerModeMs = 60000UL,
+                      const char* user = nullptr, const char* pwd = nullptr) {
+    uint8_t modes[2];
+    uint8_t count = 0;
+    switch (pref) {
+      case A7670E_PREFER_LTE:
+        modes[count++] = A7670E_MODE_LTE;
+        modes[count++] = A7670E_MODE_2G;
+        break;
+      case A7670E_PREFER_2G:
+        modes[count++] = A7670E_MODE_2G;
+        modes[count++] = A7670E_MODE_LTE;
+        break;
+      case A7670E_LTE_ONLY: modes[count++] = A7670E_MODE_LTE; break;
+      case A7670E_2G_ONLY: modes[count++] = A7670E_MODE_2G; break;
+      default: modes[count++] = A7670E_MODE_AUTO; break;
+    }
+
+    connectedMode_ = 0;
+    for (uint8_t i = 0; i < count; i++) {
+      DBG(GF("### Trying network mode"), modes[i]);
+      if (!setNetworkMode(modes[i])) { continue; }
+      if (waitForNetwork(timeoutPerModeMs) && gprsConnect(apn, user, pwd)) {
+        connectedMode_ = modes[i];
+        return true;
+      }
+      DBG(GF("### No data on mode"), modes[i]);
+    }
+    return false;
+  }
+
+  // A7670E_MODE_LTE / _2G / _AUTO after a successful connectNetwork(), else 0.
+  uint8_t getConnectedMode() const {
+    return connectedMode_;
+  }
+
+  /*
+   * Power diagnostics
+   *
+   * On battery the supply often sags during transmit bursts (up to 2 A on
+   * 2G). The modem then resets or shuts down and "stops working". These
+   * functions tell a power problem apart from a modem problem.
+   */
+ public:
+  // Optional: MCU-side supply reading in mV (ADC on the battery). Used to
+  // decide when the modem itself does not answer.
+  void setSupplyReader(A7670ESupplyReader fn) {
+    supplyReader_ = fn;
+  }
+
+  // Read the modem's own supply (AT+CBC) in mV and add it to the stats.
+  // 0 = no answer.
+  int16_t sampleVoltage() {
+    int16_t mv = getBattVoltage();
+    recordVoltage(mv);
+    return mv;
+  }
+
+  A7670EPowerStats getPowerStats() const {
+    return stats_;
+  }
+
+  void resetPowerStats() {
+    stats_          = A7670EPowerStats();
+    windowMinMv_    = 0;
+    restartSnap_    = 0;
+    diagUnderSnap_  = 0;
+  }
+
+  // True if the modem restarted since the last call. Seen from the boot
+  // messages (RDY, *ATREADY) and from echo being on again: init() turns it
+  // off, a restart turns it back on. After a restart, call init() and
+  // connect again.
+  bool checkRestarted() {
+    waitResponse(100L);  // handle queued URCs (RDY, UNDER-VOLTAGE ...)
+    sendAT(GF(""));
+    String data;
+    if (waitResponse(1000L, data) == 1 && data.indexOf("AT") >= 0) {
+      sendAT(GF("E0"));
+      waitResponse();
+      if (stats_.reboots == restartSnap_) { noteBoot(); }  // URC was missed
+    }
+    bool restarted = stats_.reboots != restartSnap_;
+    restartSnap_   = stats_.reboots;
+    return restarted;
+  }
+
+  /**
+   * Quick check, no radio activity. Call it when a send/connect fails to
+   * learn whether the supply is to blame.
+   */
+  A7670EPowerVerdict diagnosePower() {
+    if (!testAT(3000L)) {
+      stats_.mcuSupplyMv = supplyReader_ ? supplyReader_() : 0;
+      if (stats_.underVoltPowerDowns > 0 && consumeUnderVoltage()) {
+        return A7670E_PWR_BROWNOUT;
+      }
+      if (!supplyReader_) { return A7670E_PWR_NO_RESPONSE; }
+      return stats_.mcuSupplyMv < TINY_GSM_A7670E_VBAT_CRITICAL_MV
+                 ? A7670E_PWR_BROWNOUT
+                 : A7670E_PWR_MODEM_ISSUE;
+    }
+
+    bool    restarted = checkRestarted();
+    int16_t mv        = sampleVoltage();
+    bool    underV    = consumeUnderVoltage();
+    bool    low = (mv > 0 && mv < TINY_GSM_A7670E_VBAT_LOW_MV) ||
+               (windowMinMv_ > 0 && windowMinMv_ < TINY_GSM_A7670E_VBAT_LOW_MV);
+    windowMinMv_ = mv;  // next window starts now
+
+    if (restarted) {
+      return (underV || low) ? A7670E_PWR_BROWNOUT : A7670E_PWR_RUN_STRESS_TEST;
+    }
+    if (underV || low) { return A7670E_PWR_WEAK; }
+    return A7670E_PWR_OK;
+  }
+
+  /**
+   * Load test: turns the radio off and on (optionally forced to 2G, the
+   * heaviest load) and reads VBAT every few ms while the modem registers.
+   * A restart or a large sag here means the supply is the problem; a clean
+   * pass means it is not. Run it before connecting: it leaves the modem
+   * registered but without data, and restores the network mode.
+   */
+  A7670EPowerTest powerStressTest(uint32_t durationMs = 30000UL,
+                                  bool     force2G    = true) {
+    A7670EPowerTest t = A7670EPowerTest();
+    checkRestarted();  // start from a clean restart flag
+    consumeUnderVoltage();
+
+    int32_t sum = 0;
+    uint8_t n   = 0;
+    for (uint8_t i = 0; i < 5; i++) {
+      int16_t mv = sampleVoltage();
+      if (mv > 0) {
+        sum += mv;
+        n++;
+      }
+      delay(100);
+    }
+    t.idleMv = n ? static_cast<int16_t>(sum / n) : 0;
+    t.minMv  = t.idleMv;
+
+    int16_t oldMode = getNetworkMode();
+    if (force2G) { setNetworkMode(A7670E_MODE_2G); }
+    setPhoneFunctionality(0);
+    delay(1000);
+    setPhoneFunctionality(1);  // registration -> transmit bursts
+
+    uint8_t        misses = 0;
+    const uint32_t start  = millis();
+    while (millis() - start < durationMs) {
+      sendAT(GF("+CBC"));
+      if (waitResponse(1000L, GF(AT_NL "+CBC:")) == 1) {
+        int16_t mv =
+            static_cast<int16_t>(streamGetFloatBefore('\n') * 1000);
+        waitResponse();
+        recordVoltage(mv);
+        t.samples++;
+        if (mv > 0 && (t.minMv == 0 || mv < t.minMv)) { t.minMv = mv; }
+        misses = 0;
+      } else if (++misses >= 5) {
+        t.stoppedAnswering = true;
+        break;
+      }
+      delay(TINY_GSM_A7670E_STRESS_SAMPLE_MS);
+    }
+
+    if (t.stoppedAnswering) {
+      testAT(20000L);  // give a rebooting modem time to come back
+    }
+    t.restarted    = checkRestarted();
+    t.underVoltage = consumeUnderVoltage();
+    t.dropMv = (t.idleMv > 0 && t.minMv > 0) ? t.idleMv - t.minMv : 0;
+
+    if (oldMode > 0 && !t.stoppedAnswering) {
+      setNetworkMode(static_cast<uint8_t>(oldMode));
+    }
+
+    if (t.stoppedAnswering && !t.restarted && supplyReader_) {
+      stats_.mcuSupplyMv = supplyReader_();
+      t.verdict = stats_.mcuSupplyMv < TINY_GSM_A7670E_VBAT_CRITICAL_MV
+                      ? A7670E_PWR_BROWNOUT
+                      : A7670E_PWR_MODEM_ISSUE;
+    } else if (t.restarted || t.stoppedAnswering) {
+      t.verdict = A7670E_PWR_BROWNOUT;  // died under radio load
+    } else if (t.underVoltage ||
+               (t.minMv > 0 && t.minMv < TINY_GSM_A7670E_VBAT_LOW_MV) ||
+               t.dropMv > TINY_GSM_A7670E_VBAT_MAX_DROP_MV) {
+      t.verdict = A7670E_PWR_WEAK;
+    } else {
+      t.verdict = A7670E_PWR_OK;
+    }
+    return t;
+  }
+
+ protected:
+  void recordVoltage(int16_t mv) {
+    if (mv <= 0) { return; }
+    stats_.lastMv = mv;
+    stats_.samples++;
+    if (stats_.minMv == 0 || mv < stats_.minMv) { stats_.minMv = mv; }
+    if (mv > stats_.maxMv) { stats_.maxMv = mv; }
+    if (windowMinMv_ == 0 || mv < windowMinMv_) { windowMinMv_ = mv; }
+  }
+
+  void noteBoot() {
+    // RDY and *ATREADY both arrive on one boot; count it once.
+    if (stats_.reboots == restartSnap_ || millis() - lastBootMs_ > 5000UL) {
+      stats_.reboots++;
+    }
+    lastBootMs_ = millis();
+    connectedMode_ = 0;
+    for (int i = 0; i < TINY_GSM_MUX_COUNT; i++) {
+      if (sockets[i]) { sockets[i]->sock_connected = false; }
+    }
+    DBG("### Modem restarted");
+  }
+
+  // True if new under-voltage URCs arrived since the last call.
+  bool consumeUnderVoltage() {
+    uint16_t total = stats_.underVoltWarnings + stats_.underVoltPowerDowns;
+    bool     fresh = total != diagUnderSnap_;
+    diagUnderSnap_ = total;
+    return fresh;
   }
 
  public:
   Stream& stream;
 
  protected:
-  GsmClientA7670E* sockets[TINY_GSM_MUX_COUNT];
+  GsmClientA7670E*   sockets[TINY_GSM_MUX_COUNT];
+  A7670EPowerStats   stats_;
+  A7670ESupplyReader supplyReader_;
+  int16_t            windowMinMv_;
+  uint16_t           restartSnap_;
+  uint16_t           diagUnderSnap_;
+  uint32_t           lastBootMs_;
+  uint8_t            connectedMode_;
 };
 
 // Same names TinyGsmClient.h would give, so existing code keeps working.
